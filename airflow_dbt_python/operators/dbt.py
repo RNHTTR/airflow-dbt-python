@@ -30,6 +30,23 @@ base_template_fields = [
     "env_vars",
 ]
 
+def _find_all_job_ids(obj):
+    result = []
+
+    def _search(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == 'job_id':
+                    result.append(v)
+                else:
+                    _search(v)
+        elif isinstance(o, list):
+            for item in o:
+                _search(item)
+
+    _search(obj)
+    return result[0] if len(result) == 1 else result
+
 
 class DbtBaseOperator(BaseOperator):
     """The basic Airflow dbt operator.
@@ -213,6 +230,75 @@ class DbtBaseOperator(BaseOperator):
 
         serializable_result = self.make_run_results_serializable(result.run_results)
         return serializable_result
+
+    def get_openlineage_facets_on_complete(self, task_instance):
+        """
+        Retrieve OpenLineage data for a COMPLETE BigQuery job.
+
+        This method retrieves statistics for the specified job_ids using the BigQueryDatasetsProvider.
+        It calls BigQuery API, retrieving input and output dataset info from it, as well as run-level
+        usage statistics.
+
+        Run facets should contain:
+            - ExternalQueryRunFacet
+            - BigQueryJobRunFacet
+
+        Job facets should contain:
+            - SqlJobFacet if operator has self.sql
+
+        Input datasets should contain facets:
+            - DataSourceDatasetFacet
+            - SchemaDatasetFacet
+
+        Output datasets should contain facets:
+            - DataSourceDatasetFacet
+            - SchemaDatasetFacet
+            - OutputStatisticsOutputDatasetFacet
+        """
+        print("---- STARTING OL EXTRACTION -----")
+        from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+        from airflow.providers.openlineage.extractors import OperatorLineage
+        from airflow.providers.openlineage.utils.utils import normalize_sql
+
+        from openlineage.client.facet import SqlJobFacet
+        from openlineage.common.provider.bigquery import BigQueryDatasetsProvider
+
+        hook = BigQueryHook(gcp_conn_id='google_cloud_default', use_legacy_sql=False)
+        client = hook.get_client(project_id=self.hook.project_id)
+        xcom_value = task_instance.xcom_pull()
+
+        job_id = _find_all_job_ids(xcom_value)
+
+        if not self.job_id:
+            return OperatorLineage()
+
+        if isinstance(self.job_id, str):
+            job_ids = [self.job_id]
+
+        inputs, outputs, run_facets = {}, {}, {}
+        for job_id in job_ids:
+            stats = BigQueryDatasetsProvider(client=client).get_facets(job_id=job_id)
+            for input in stats.inputs:
+                input = input.to_openlineage_dataset()
+                inputs[input.name] = input
+            if stats.output:
+                output = stats.output.to_openlineage_dataset()
+                outputs[output.name] = output
+            for key, value in stats.run_facets.items():
+                run_facets[key] = value
+
+        job_facets = {}
+        if hasattr(self, "sql"):
+            job_facets["sql"] = SqlJobFacet(query=normalize_sql(self.sql))
+
+        print("------ WRITING OL DATA -------")
+
+        return OperatorLineage(
+            inputs=list(inputs.values()),
+            outputs=list(outputs.values()),
+            run_facets=run_facets,
+            job_facets=job_facets,
+        )
 
     @property
     def command(self) -> str:
